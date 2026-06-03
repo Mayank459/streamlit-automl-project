@@ -8,8 +8,13 @@ from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, confusion_matrix
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from supervised import AutoML
+try:
+    from supervised import AutoML
+    HAS_AUTOML = True
+except ImportError:
+    HAS_AUTOML = False
 import numpy as np
+import shutil
 import os
 import time
 
@@ -21,6 +26,9 @@ if 'automl_model' not in st.session_state:
     st.session_state.automl_model = None
 if 'model_columns' not in st.session_state:
     st.session_state.model_columns = None
+# Dict of all trained sklearn models: {display_name: {model, features, type}}
+if 'trained_models' not in st.session_state:
+    st.session_state.trained_models = {}
 
 st.title("Advanced Data Analysis Dashboard")
 
@@ -28,11 +36,14 @@ st.title("Advanced Data Analysis Dashboard")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["Data Overview", "Exploratory Analysis", "Traditional ML", "AutoML", "Predictions"])
 
-uploaded_file = st.sidebar.file_uploader("Upload your CSV file", type=["csv"], key="file_uploader")
+uploaded_file = st.sidebar.file_uploader("Upload your CSV or Excel file", type=["csv", "xlsx"], key="file_uploader")
 
 if uploaded_file is not None:
     # Load Data
-    df = pd.read_csv(uploaded_file)
+    if uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
     
     # Ensure only numeric columns are used for numeric operations
     df_numeric = df.select_dtypes(include=['number'])
@@ -104,7 +115,7 @@ if uploaded_file is not None:
             selected_group_col = st.selectbox("Group by (optional)", ["None"] + list(df.columns))
             
             if selected_group_col == "None":
-                fig = px.box(df, y=selected_box_col)
+                fig = px.box(df[[selected_box_col]], y=selected_box_col)
             else:
                 fig = px.box(df, x=selected_group_col, y=selected_box_col)
             st.plotly_chart(fig, use_container_width=True)
@@ -144,23 +155,24 @@ if uploaded_file is not None:
             agg_col = st.selectbox("Select column to aggregate", df_numeric.columns)
             agg_func = st.selectbox("Select aggregation function", ["mean", "median", "sum", "count", "min", "max"])
             
+            agg_name = f"{agg_col}_{agg_func}"
             if agg_func == "mean":
-                grouped_df = df.groupby(group_col)[agg_col].mean().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].mean().reset_index(name=agg_name)
             elif agg_func == "median":
-                grouped_df = df.groupby(group_col)[agg_col].median().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].median().reset_index(name=agg_name)
             elif agg_func == "sum":
-                grouped_df = df.groupby(group_col)[agg_col].sum().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].sum().reset_index(name=agg_name)
             elif agg_func == "count":
-                grouped_df = df.groupby(group_col)[agg_col].count().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].count().reset_index(name=agg_name)
             elif agg_func == "min":
-                grouped_df = df.groupby(group_col)[agg_col].min().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].min().reset_index(name=agg_name)
             else:
-                grouped_df = df.groupby(group_col)[agg_col].max().reset_index()
+                grouped_df = df.groupby(group_col)[agg_col].max().reset_index(name=agg_name)
             
             st.write(grouped_df)
             
             # Bar chart for grouped data
-            fig = px.bar(grouped_df, x=group_col, y=agg_col, title=f"{agg_func.capitalize()} of {agg_col} by {group_col}")
+            fig = px.bar(grouped_df, x=group_col, y=agg_name, title=f"{agg_func.capitalize()} of {agg_col} by {group_col}")
             st.plotly_chart(fig, use_container_width=True)
     
     # TRADITIONAL ML PAGE
@@ -236,9 +248,17 @@ if uploaded_file is not None:
                             fig = px.bar(x=feature_importance.index, y=feature_importance.values, title="Feature Importance")
                             st.plotly_chart(fig, use_container_width=True)
                         
-                        # Store model in session state
+                        # Store model in session state (legacy + named registry)
                         st.session_state.reg_model = best_model
                         st.session_state.reg_features = features
+                        model_name = f"Regression — {model_choice} [{time.strftime('%H:%M:%S')}]"
+                        st.session_state.trained_models[model_name] = {
+                            "model": best_model,
+                            "features": features,
+                            "type": "regression",
+                            "feature_types": {f: "numeric" for f in features},
+                        }
+                        st.success(f"Model saved as **{model_name}**")
         
         with tab2:
             st.write("### Classification Model Training")
@@ -309,9 +329,17 @@ if uploaded_file is not None:
                             fig = px.bar(x=feature_importance.index, y=feature_importance.values, title="Feature Importance")
                             st.plotly_chart(fig, use_container_width=True)
                             
-                            # Store model in session state
+                            # Store model in session state (legacy + named registry)
                             st.session_state.class_model = best_model
                             st.session_state.class_features = features
+                            model_name = f"Classification — RandomForest [{time.strftime('%H:%M:%S')}]"
+                            st.session_state.trained_models[model_name] = {
+                                "model": best_model,
+                                "features": features,
+                                "type": "classification",
+                                "feature_types": {f: "numeric" for f in features},
+                            }
+                            st.success(f"Model saved as **{model_name}**")
         
         with tab3:
             st.write("### K-Means Clustering")
@@ -374,9 +402,14 @@ if uploaded_file is not None:
     elif page == "AutoML":
         st.header("AutoML with mljar-supervised")
         
-        # Create a results directory
-        results_path = "./automl_results"
-        os.makedirs(results_path, exist_ok=True)
+        if not HAS_AUTOML:
+            st.error("The `mljar-supervised` package is not installed or failed to import. "
+                     "Please make sure it is installed via `pip install mljar-supervised`.")
+            st.info("Note: `mljar-supervised` has native dependencies (like lightgbm, xgboost, catboost) "
+                     "which might require additional build tools on some platforms.")
+            st.stop()
+            
+        # Results directory — created fresh on each training run (see Train button handler)
         
         # Target selection
         st.write("### Select Target and Settings")
@@ -442,6 +475,12 @@ if uploaded_file is not None:
                 try:
                     # Start timer
                     start_time = time.time()
+
+                    # Use a fresh results directory for every run to avoid stale params
+                    results_path = f"./automl_results_{int(start_time)}"
+                    if os.path.exists(results_path):
+                        shutil.rmtree(results_path)
+                    os.makedirs(results_path)
                     
                     # Prepare data
                     X = df.drop(columns=[target_column])
@@ -461,17 +500,31 @@ if uploaded_file is not None:
                         "Neural Network": "Neural Network"
                     }
                     selected_algorithms = [algorithms_mapping[algo] for algo in algorithms]
+
+                    # Optuna mode does not support simple algorithms (Linear, Decision Tree, Baseline)
+                    OPTUNA_INCOMPATIBLE = {"Linear", "Decision Tree", "Baseline", "Nearest Neighbors"}
+                    if mode == "Optuna":
+                        selected_algorithms = [a for a in selected_algorithms if a not in OPTUNA_INCOMPATIBLE]
+                        if not selected_algorithms:
+                            st.error("Optuna mode requires at least one tunable algorithm (e.g. LightGBM, Xgboost, Random Forest, CatBoost, Neural Network, Extra Trees). Please select one and retry.")
+                            st.stop()
                     
                     # Initialize AutoML
-                    automl = AutoML(
-                        results_path=results_path,
-                        mode=mode,
-                        ml_task=ml_task,
-                        algorithms=selected_algorithms,
-                        total_time_limit=time_limit,
-                        explain_level=explain_level,
-                        random_state=42,
-                    )
+                    automl_kwargs = {
+                        "results_path": results_path,
+                        "mode": mode,
+                        "ml_task": ml_task,
+                        "algorithms": selected_algorithms,
+                        "total_time_limit": int(time_limit),
+                        "explain_level": explain_level,
+                        "random_state": 42,
+                    }
+                    
+                    if mode == "Optuna":
+                        # optuna_time_budget is time per algorithm (not total); default to 300s each
+                        automl_kwargs["optuna_time_budget"] = max(60, int(time_limit // max(1, len(selected_algorithms))))
+                        
+                    automl = AutoML(**automl_kwargs)
                     
                     # Train the model
                     automl.fit(X, y)
@@ -535,7 +588,9 @@ if uploaded_file is not None:
                         st.warning(f"Could not generate predictions on training data: {str(e)}")
                 
                 except Exception as e:
+                    import traceback
                     st.error(f"An error occurred: {e}")
+                    st.code(traceback.format_exc())
                     st.info("Check that you have the mljar-supervised package installed: pip install mljar-supervised")
                     
                     # Try to get version info
@@ -554,156 +609,208 @@ if uploaded_file is not None:
     elif page == "Predictions":
         st.header("Make Predictions")
         
-        prediction_tabs = st.tabs(["Manual Input", "File Upload", "Sample Predictions"])
+        prediction_tabs = st.tabs(["Manual Input", "File Upload", "Sample Predictions", "⬇️ Download Model"])
         
         with prediction_tabs[0]:
             st.write("### Manual Input for Prediction")
-            
-            if 'reg_model' in st.session_state or 'class_model' in st.session_state or 'automl_model' in st.session_state:
-                # Determine which models are available
-                available_models = []
-                if 'reg_model' in st.session_state:
-                    available_models.append("Regression Model")
-                if 'class_model' in st.session_state:
-                    available_models.append("Classification Model")
-                if 'automl_model' in st.session_state:
-                    available_models.append("AutoML Model")
-                
-                # Let user select a model
+
+            # ── Build the full list of selectable models ─────────────────────────────
+            available_models = list(st.session_state.trained_models.keys())
+
+            # AutoML — overall best model
+            if 'automl_model' in st.session_state and st.session_state.automl_model is not None:
+                available_models.append("AutoML — Best Model")
+
+                # AutoML — individual leaderboard entries
+                automl_results_path = getattr(st.session_state.automl_model, '_results_path', None)
+                if automl_results_path and os.path.exists(automl_results_path):
+                    try:
+                        lb_path = os.path.join(automl_results_path, "leaderboard.csv")
+                        if os.path.exists(lb_path):
+                            lb_df = pd.read_csv(lb_path)
+                            if 'name' in lb_df.columns:
+                                for model_name in lb_df['name'].tolist():
+                                    available_models.append(f"AutoML — {model_name}")
+                    except Exception:
+                        pass
+
+            # Upload a saved .pkl model
+            available_models.append("Upload Saved Model (.pkl)")
+
+            if not available_models or available_models == ["Upload Saved Model (.pkl)"]:
+                st.warning("No trained models found. Please train a model first.")
+            else:
                 selected_model = st.selectbox("Select model for prediction", available_models)
-                
-                if selected_model == "Regression Model" and 'reg_model' in st.session_state:
-                    features = st.session_state.reg_features
+
+                # ── Handle uploaded .pkl ─────────────────────────────────────────
+                if selected_model == "Upload Saved Model (.pkl)":
+                    import io, joblib
+                    uploaded_pkl = st.file_uploader("Upload a joblib .pkl model file", type=["pkl"])
+                    if uploaded_pkl:
+                        try:
+                            loaded_model = joblib.load(io.BytesIO(uploaded_pkl.read()))
+                            st.success("Model loaded successfully!")
+                            # Collect feature names from user
+                            feature_names_input = st.text_input(
+                                "Enter feature names used during training (comma-separated)"
+                            )
+                            if feature_names_input:
+                                pkl_features = [f.strip() for f in feature_names_input.split(",") if f.strip()]
+                                user_input = {}
+                                col1, col2 = st.columns(2)
+                                for i, feature in enumerate(pkl_features):
+                                    col = col1 if i % 2 == 0 else col2
+                                    with col:
+                                        if feature in df.columns and pd.api.types.is_numeric_dtype(df[feature]):
+                                            user_input[feature] = st.number_input(
+                                                feature, value=float(df[feature].mean()), key=f"pkl_{feature}"
+                                            )
+                                        elif feature in df.columns:
+                                            unique_vals = df[feature].dropna().unique().tolist()
+                                            user_input[feature] = st.selectbox(
+                                                feature, options=unique_vals, key=f"pkl_{feature}"
+                                            )
+                                        else:
+                                            user_input[feature] = st.number_input(feature, value=0.0, key=f"pkl_{feature}")
+                                if st.button("Predict (Uploaded Model)"):
+                                    try:
+                                        pred = loaded_model.predict(pd.DataFrame([user_input]))
+                                        st.success(f"Prediction: {pred[0]}")
+                                    except Exception as e:
+                                        st.error(f"Prediction error: {e}")
+                        except Exception as e:
+                            st.error(f"Could not load model: {e}")
+
+                # ── Sklearn model from registry ──────────────────────────────────
+                elif selected_model in st.session_state.trained_models:
+                    entry = st.session_state.trained_models[selected_model]
+                    model = entry["model"]
+                    features = entry["features"]
+                    model_type = entry["type"]
+
+                    st.write(f"**Type:** `{model_type}` | **Features:** {len(features)}")
                     user_input = {}
-                    
-                    st.write("Enter feature values:")
                     col1, col2 = st.columns(2)
                     for i, feature in enumerate(features):
-                        if i % 2 == 0:
-                            with col1:
-                                user_input[feature] = st.number_input(
-                                    f"{feature}", 
-                                    value=float(df[feature].mean()),
-                                    key=f"reg_{feature}"
-                                )
-                        else:
-                            with col2:
-                                user_input[feature] = st.number_input(
-                                    f"{feature}", 
-                                    value=float(df[feature].mean()),
-                                    key=f"reg_{feature}"
-                                )
-                    
-                    if st.button("Predict (Regression)"):
-                        input_df = pd.DataFrame([user_input])
-                        prediction = st.session_state.reg_model.predict(input_df)
-                        st.success(f"Predicted Value: {prediction[0]:.4f}")
-                
-                elif selected_model == "Classification Model" and 'class_model' in st.session_state:
-                    features = st.session_state.class_features
-                    user_input = {}
-                    
-                    st.write("Enter feature values:")
-                    col1, col2 = st.columns(2)
-                    for i, feature in enumerate(features):
-                        if i % 2 == 0:
-                            with col1:
-                                user_input[feature] = st.number_input(
-                                    f"{feature}", 
-                                    value=float(df[feature].mean()),
-                                    key=f"class_{feature}"
-                                )
-                        else:
-                            with col2:
-                                user_input[feature] = st.number_input(
-                                    f"{feature}", 
-                                    value=float(df[feature].mean()),
-                                    key=f"class_{feature}"
-                                )
-                    
-                    if st.button("Predict (Classification)"):
-                        input_df = pd.DataFrame([user_input])
-                        prediction = st.session_state.class_model.predict(input_df)
-                        st.success(f"Predicted Class: {prediction[0]}")
-                
-                elif selected_model == "AutoML Model" and 'automl_model' in st.session_state:
-                    # Get all features needed for AutoML model
+                        col = col1 if i % 2 == 0 else col2
+                        with col:
+                            user_input[feature] = st.number_input(
+                                feature,
+                                value=float(df[feature].mean()) if feature in df.columns else 0.0,
+                                key=f"reg_cls_{selected_model}_{feature}"
+                            )
+                    if st.button(f"Predict"):
+                        try:
+                            pred = model.predict(pd.DataFrame([user_input]))
+                            if model_type == "regression":
+                                st.success(f"Predicted Value: {pred[0]:.4f}")
+                            else:
+                                st.success(f"Predicted Class: {pred[0]}")
+                                if hasattr(model, 'predict_proba'):
+                                    proba = model.predict_proba(pd.DataFrame([user_input]))[0]
+                                    fig = px.bar(x=[f"Class {i}" for i in range(len(proba))], y=proba,
+                                                 title="Class Probabilities")
+                                    st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Prediction error: {e}")
+
+                # ── AutoML — Best Model ───────────────────────────────────────
+                elif selected_model == "AutoML — Best Model":
                     if st.session_state.model_columns:
                         features = st.session_state.model_columns
                         user_input = {}
-                        
                         st.write("Enter feature values:")
                         col1, col2 = st.columns(2)
                         for i, feature in enumerate(features):
-                            if i % 2 == 0:
-                                with col1:
+                            col = col1 if i % 2 == 0 else col2
+                            with col:
+                                if feature in df.columns and pd.api.types.is_numeric_dtype(df[feature]):
                                     user_input[feature] = st.number_input(
-                                        f"{feature}", 
-                                        value=float(df[feature].mean()),
-                                        key=f"auto_{feature}"
+                                        feature, value=float(df[feature].mean()), key=f"automl_best_{feature}"
                                     )
-                            else:
-                                with col2:
-                                    user_input[feature] = st.number_input(
-                                        f"{feature}", 
-                                        value=float(df[feature].mean()),
-                                        key=f"auto_{feature}"
+                                elif feature in df.columns:
+                                    unique_vals = df[feature].dropna().unique().tolist()
+                                    user_input[feature] = st.selectbox(
+                                        feature, options=unique_vals, key=f"automl_best_{feature}"
                                     )
-
-                    if st.button("Predict (AutoML)"):
+                                else:
+                                    user_input[feature] = st.number_input(feature, value=0.0, key=f"automl_best_{feature}")
+                        if st.button("Predict (AutoML Best)"):
                             try:
                                 input_df = pd.DataFrame([user_input])
                                 prediction = st.session_state.automl_model.predict(input_df)
-                                
-                                # Handle different prediction types
-                                if isinstance(prediction, np.ndarray):
-                                    if len(prediction.shape) == 1:
-                                        st.success(f"Predicted Value: {prediction[0]}")
-                                    else:
-                                        st.success(f"Prediction: {prediction[0]}")
-                                else:
-                                    st.success(f"Prediction: {prediction}")
-                                
-                                # If probability predictions are available (for classification)
-                                try:
-                                    if hasattr(st.session_state.automl_model, 'predict_proba'):
+                                st.success(f"Prediction: {prediction[0]}")
+                                if hasattr(st.session_state.automl_model, 'predict_proba'):
+                                    try:
                                         proba = st.session_state.automl_model.predict_proba(input_df)
-                                        st.write("### Prediction Probabilities")
-                                        
-                                        # Format as dataframe for display
-                                        if isinstance(proba, np.ndarray):
-                                            if len(proba.shape) > 1 and proba.shape[1] > 1:
-                                                proba_df = pd.DataFrame(proba[0])
-                                                proba_df.columns = [f"Class {i}" for i in range(proba_df.shape[1])]
-                                                st.dataframe(proba_df.T)
-                                                
-                                                # Show bar chart of probabilities
-                                                fig = px.bar(
-                                                    x=[f"Class {i}" for i in range(proba.shape[1])],
-                                                    y=proba[0],
-                                                    title="Prediction Probabilities"
-                                                )
-                                                st.plotly_chart(fig, use_container_width=True)
-                                except Exception as e:
-                                    st.info(f"Probability information not available: {str(e)}")
+                                        if isinstance(proba, np.ndarray) and proba.ndim > 1 and proba.shape[1] > 1:
+                                            fig = px.bar(x=[f"Class {i}" for i in range(proba.shape[1])],
+                                                         y=proba[0], title="Prediction Probabilities")
+                                            st.plotly_chart(fig, use_container_width=True)
+                                    except Exception:
+                                        pass
                             except Exception as e:
-                                st.error(f"Prediction error: {str(e)}")
-                                st.info("Make sure the input features match the features used during training.")
+                                st.error(f"Prediction error: {e}")
+
+                # ── AutoML — Specific Leaderboard Model ─────────────────────────
+                elif selected_model.startswith("AutoML — "):
+                    lb_model_name = selected_model.replace("AutoML — ", "", 1)
+                    automl_results_path = getattr(st.session_state.automl_model, '_results_path', None)
+                    model_dir = os.path.join(automl_results_path, lb_model_name) if automl_results_path else None
+
+                    if model_dir and os.path.exists(model_dir) and st.session_state.model_columns:
+                        import joblib, glob
+                        # Try to load the individual model's framework pickle
+                        pkl_files = glob.glob(os.path.join(model_dir, "*.pkl"))
+                        if pkl_files:
+                            try:
+                                lb_model = joblib.load(pkl_files[0])
+                                features = st.session_state.model_columns
+                                user_input = {}
+                                st.write(f"**Model:** `{lb_model_name}` | **Features:** {len(features)}")
+                                col1, col2 = st.columns(2)
+                                for i, feature in enumerate(features):
+                                    col = col1 if i % 2 == 0 else col2
+                                    with col:
+                                        if feature in df.columns and pd.api.types.is_numeric_dtype(df[feature]):
+                                            user_input[feature] = st.number_input(
+                                                feature, value=float(df[feature].mean()), key=f"lb_{lb_model_name}_{feature}"
+                                            )
+                                        elif feature in df.columns:
+                                            unique_vals = df[feature].dropna().unique().tolist()
+                                            user_input[feature] = st.selectbox(
+                                                feature, options=unique_vals, key=f"lb_{lb_model_name}_{feature}"
+                                            )
+                                        else:
+                                            user_input[feature] = st.number_input(feature, value=0.0, key=f"lb_{lb_model_name}_{feature}")
+                                if st.button(f"Predict ({lb_model_name})"):
+                                    try:
+                                        pred = st.session_state.automl_model.predict(pd.DataFrame([user_input]))
+                                        st.success(f"Prediction: {pred[0]}")
+                                    except Exception as e:
+                                        st.error(f"Prediction error: {e}")
+                            except Exception as e:
+                                st.warning(f"Could not load individual model file: {e}. Using AutoML best model instead.")
+                                st.info("Tip: Use 'AutoML — Best Model' for reliable predictions.")
+                        else:
+                            st.info(f"No standalone pickle found for `{lb_model_name}`. The AutoML best model will be used for predictions.")
                     else:
-                        st.warning("Feature information for AutoML model not available.")
-            else:
-                st.warning("No trained models available. Please train a model in the respective tabs first.")
+                        st.warning("Model directory not found or features unavailable.")
 
         with prediction_tabs[1]:
+
             st.write("### Predict from File")
             
-            pred_file = st.file_uploader("Upload file for prediction", type=["csv"])
+            pred_file = st.file_uploader("Upload file for prediction", type=["csv", "xlsx"])
             if pred_file is not None:
-                pred_df = pd.read_csv(pred_file)
+                if pred_file.name.endswith('.csv'):
+                    pred_df = pd.read_csv(pred_file)
+                else:
+                    pred_df = pd.read_excel(pred_file)
                 st.write("Preview of uploaded data:")
                 st.write(pred_df.head())
                 
-                if 'automl_model' in st.session_state:
+                if 'automl_model' in st.session_state and st.session_state.automl_model is not None:
                     if st.button("Generate Predictions"):
                         try:
                             # Check for required columns
@@ -748,7 +855,7 @@ if uploaded_file is not None:
         with prediction_tabs[2]:
             st.write("### Sample Predictions")
             
-            if 'automl_model' in st.session_state:
+            if 'automl_model' in st.session_state and st.session_state.automl_model is not None:
                 # Select a random sample from the dataset
                 sample_size = st.slider("Number of random samples", 1, 20, 5)
                 if st.button("Generate Sample Predictions"):
@@ -798,6 +905,79 @@ if uploaded_file is not None:
                         st.warning("Feature information not available. Please retrain the model.")
             else:
                 st.warning("No AutoML model available. Please train a model first.")
+
+        with prediction_tabs[3]:
+            st.write("### Download Trained Models")
+            st.write("Download your trained models to use them later or deploy elsewhere.")
+
+            has_any_model = (
+                ('reg_model' in st.session_state) or
+                ('class_model' in st.session_state) or
+                ('automl_model' in st.session_state and st.session_state.automl_model is not None)
+            )
+
+            if not has_any_model:
+                st.warning("No trained models found. Please train a model first.")
+            else:
+                import io, zipfile, joblib
+
+                # ── AutoML Model ──────────────────────────────────────────────
+                if 'automl_model' in st.session_state and st.session_state.automl_model is not None:
+                    st.subheader("AutoML Model (mljar-supervised)")
+                    automl_results_path = getattr(st.session_state.automl_model, '_results_path', None)
+                    if automl_results_path and os.path.exists(automl_results_path):
+                        # Bundle the entire AutoML results folder into a ZIP
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for root_dir, dirs, files in os.walk(automl_results_path):
+                                for file in files:
+                                    file_path = os.path.join(root_dir, file)
+                                    arcname = os.path.relpath(file_path, automl_results_path)
+                                    zf.write(file_path, arcname)
+                        zip_buffer.seek(0)
+                        st.info(
+                            "The AutoML model is saved as a ZIP of its results folder. "
+                            "To reload it: `automl = AutoML(results_path='<extracted_folder>'); automl.predict(X)`"
+                        )
+                        st.download_button(
+                            label="⬇️ Download AutoML Model (ZIP)",
+                            data=zip_buffer,
+                            file_name="automl_model.zip",
+                            mime="application/zip",
+                            key="dl_automl",
+                        )
+                    else:
+                        st.warning("AutoML results folder not found. The model may have been trained in a previous session.")
+
+                # ── Traditional Regression Model ──────────────────────────────
+                if 'reg_model' in st.session_state:
+                    st.subheader("Regression Model (scikit-learn)")
+                    reg_buffer = io.BytesIO()
+                    joblib.dump(st.session_state.reg_model, reg_buffer)
+                    reg_buffer.seek(0)
+                    st.info("To reload: `import joblib; model = joblib.load('regression_model.pkl')`")
+                    st.download_button(
+                        label="⬇️ Download Regression Model (.pkl)",
+                        data=reg_buffer,
+                        file_name="regression_model.pkl",
+                        mime="application/octet-stream",
+                        key="dl_reg",
+                    )
+
+                # ── Traditional Classification Model ──────────────────────────
+                if 'class_model' in st.session_state:
+                    st.subheader("Classification Model (scikit-learn)")
+                    cls_buffer = io.BytesIO()
+                    joblib.dump(st.session_state.class_model, cls_buffer)
+                    cls_buffer.seek(0)
+                    st.info("To reload: `import joblib; model = joblib.load('classification_model.pkl')`")
+                    st.download_button(
+                        label="⬇️ Download Classification Model (.pkl)",
+                        data=cls_buffer,
+                        file_name="classification_model.pkl",
+                        mime="application/octet-stream",
+                        key="dl_cls",
+                    )
 
 else:
     st.info("Please upload a CSV file to get started.")
