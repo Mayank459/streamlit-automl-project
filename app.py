@@ -459,14 +459,23 @@ if uploaded_file is not None:
         with col2:
             time_limit = st.number_input(
                 "Time limit (seconds)",
-                value=600,
-                min_value=60,
-                help="Maximum time for AutoML training",
+                value=300,
+                min_value=120,
+                help="Minimum 120s recommended. On Streamlit Cloud, use at least 300s.",
             )
             algorithms = st.multiselect(
                 "Select algorithms to include",
                 ["Linear", "Random Forest", "Extra Trees", "LightGBM", "Xgboost", "CatBoost", "Neural Network"],
-                default=["Linear", "Random Forest", "LightGBM"]
+                default=["Linear", "Random Forest"],
+                help="Start with Linear + Random Forest for fastest results. Add heavier models (LightGBM, Xgboost) if you have sufficient time budget."
+            )
+
+        # Resource warning for cloud deployments
+        import platform
+        if not os.path.exists("/usr/local/lib") and os.path.exists("/mount/src"):
+            st.warning(
+                "Running on Streamlit Cloud. For reliable results, use `Explain` or `Perform` mode "
+                "with `Linear` and `Random Forest` only, and set explain level to 0 or 1."
             )
         
         # Train button
@@ -510,22 +519,28 @@ if uploaded_file is not None:
                             st.stop()
                     
                     # Initialize AutoML
+                    # model_time_limit ensures each model gets enough wall-clock time to
+                    # complete at least one fold — critical on slow cloud CPUs.
+                    # Set to 20% of total budget, floored at 60s, capped at 300s.
+                    per_model_limit = max(60, min(300, int(time_limit * 0.20)))
+
                     automl_kwargs = {
                         "results_path": results_path,
                         "mode": mode,
                         "ml_task": ml_task,
                         "algorithms": selected_algorithms,
                         "total_time_limit": int(time_limit),
+                        "model_time_limit": per_model_limit,
                         "explain_level": explain_level,
                         "random_state": 42,
                     }
-                    
+
                     if mode == "Optuna":
                         # optuna_time_budget is time per algorithm (not total); default to 300s each
                         automl_kwargs["optuna_time_budget"] = max(60, int(time_limit // max(1, len(selected_algorithms))))
-                        
+
                     automl = AutoML(**automl_kwargs)
-                    
+
                     # Train the model
                     automl.fit(X, y)
                     
