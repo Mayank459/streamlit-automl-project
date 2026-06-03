@@ -3,11 +3,13 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 import plotly.express as px
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, StratifiedKFold, KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, confusion_matrix
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, GradientBoostingClassifier, GradientBoostingRegressor, ExtraTreesClassifier, ExtraTreesRegressor
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
 try:
     from supervised import AutoML
     HAS_AUTOML = True
@@ -17,6 +19,124 @@ import numpy as np
 import shutil
 import os
 import time
+
+
+# ---------------------------------------------------------------------------
+# SklearnAutoML — pure scikit-learn fallback AutoML
+# Used automatically when mljar-supervised is unavailable or incompatible.
+# Mirrors the mljar AutoML interface: fit / predict / predict_proba / leaderboard
+# ---------------------------------------------------------------------------
+class SklearnAutoML:
+    """Lightweight AutoML built on scikit-learn. Works on any Python version."""
+
+    def __init__(self, ml_task="binary_classification", algorithms=None,
+                 total_time_limit=300, explain_level=0, random_state=42, **kwargs):
+        self.ml_task = ml_task
+        self.total_time_limit = total_time_limit
+        self.random_state = random_state
+        self._results_path = None  # kept for interface compatibility
+        self._models = []
+        self._leaderboard = None
+        self._best_model = None
+        self._is_classification = ml_task in ("binary_classification", "multiclass_classification")
+        self._label_encoder = LabelEncoder() if self._is_classification else None
+        self._col_encoders = {}
+
+    # ------------------------------------------------------------------
+    def _preprocess_X(self, X, fit=False):
+        X = X.copy()
+        for col in X.columns:
+            if X[col].dtype == object or str(X[col].dtype) == "string":
+                if fit:
+                    le = LabelEncoder()
+                    X[col] = le.fit_transform(X[col].astype(str))
+                    self._col_encoders[col] = le
+                else:
+                    le = self._col_encoders.get(col)
+                    if le:
+                        known = set(le.classes_)
+                        X[col] = X[col].astype(str).apply(
+                            lambda v: v if v in known else le.classes_[0]
+                        )
+                        X[col] = le.transform(X[col])
+                    else:
+                        X[col] = 0
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0)
+        return X.astype(float)
+
+    def _candidate_pipelines(self):
+        """Returns a list of (name, pipeline) tuples to try."""
+        rs = self.random_state
+        if self._is_classification:
+            return [
+                ("Linear",           Pipeline([("sc", StandardScaler()), ("m", LogisticRegression(max_iter=1000, random_state=rs))]) ),
+                ("Random Forest",    Pipeline([("m", RandomForestClassifier(n_estimators=100, random_state=rs))]) ),
+                ("Extra Trees",      Pipeline([("m", ExtraTreesClassifier(n_estimators=100, random_state=rs))]) ),
+                ("Gradient Boosting",Pipeline([("m", GradientBoostingClassifier(n_estimators=100, random_state=rs))]) ),
+            ]
+        else:
+            return [
+                ("Linear",           Pipeline([("sc", StandardScaler()), ("m", Ridge(random_state=rs))]) ),
+                ("Random Forest",    Pipeline([("m", RandomForestRegressor(n_estimators=100, random_state=rs))]) ),
+                ("Extra Trees",      Pipeline([("m", ExtraTreesRegressor(n_estimators=100, random_state=rs))]) ),
+                ("Gradient Boosting",Pipeline([("m", GradientBoostingRegressor(n_estimators=100, random_state=rs))]) ),
+            ]
+
+    def fit(self, X, y):
+        X_proc = self._preprocess_X(X, fit=True)
+        if self._is_classification:
+            y_enc = self._label_encoder.fit_transform(y.astype(str))
+            cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=self.random_state)
+            scoring = "accuracy"
+        else:
+            y_enc = y.values if hasattr(y, "values") else np.array(y)
+            cv = KFold(n_splits=3, shuffle=True, random_state=self.random_state)
+            scoring = "r2"
+
+        results = []
+        deadline = time.time() + self.total_time_limit
+
+        for name, pipeline in self._candidate_pipelines():
+            if time.time() >= deadline:
+                break
+            try:
+                scores = cross_val_score(pipeline, X_proc, y_enc, cv=cv,
+                                         scoring=scoring, error_score="raise")
+                pipeline.fit(X_proc, y_enc)
+                results.append({"name": name, "score": round(float(scores.mean()), 4),
+                                 "std": round(float(scores.std()), 4), "pipeline": pipeline})
+            except Exception:
+                pass
+
+        if not results:
+            raise RuntimeError(
+                "SklearnAutoML: no models could be trained. "
+                "Check that your data has no constant columns and sufficient rows."
+            )
+
+        results.sort(key=lambda r: r["score"], reverse=True)
+        self._models = results
+        self._best_model = results[0]["pipeline"]
+        metric = scoring
+        self._leaderboard = pd.DataFrame(
+            [{"name": r["name"], metric: r["score"], f"{metric}_std": r["std"]} for r in results]
+        )
+
+    def predict(self, X):
+        X_proc = self._preprocess_X(X)
+        preds = self._best_model.predict(X_proc)
+        if self._is_classification:
+            return self._label_encoder.inverse_transform(preds)
+        return preds
+
+    def predict_proba(self, X):
+        if not self._is_classification:
+            raise ValueError("predict_proba is only for classification tasks.")
+        X_proc = self._preprocess_X(X)
+        return self._best_model.predict_proba(X_proc)
+
+    def leaderboard(self):
+        return self._leaderboard
 
 # Set Page Config
 st.set_page_config(layout="wide", page_title="Advanced Data Analysis Dashboard")
@@ -604,16 +724,65 @@ if uploaded_file is not None:
                 
                 except Exception as e:
                     import traceback
-                    st.error(f"An error occurred: {e}")
-                    st.code(traceback.format_exc())
-                    st.info("Check that you have the mljar-supervised package installed: pip install mljar-supervised")
-                    
-                    # Try to get version info
+                    mljar_error = str(e)
+                    mljar_tb = traceback.format_exc()
+
+                    # Auto-fallback to SklearnAutoML when mljar-supervised fails
+                    # (common on Python 3.14 / restricted cloud environments)
+                    st.warning(
+                        f"mljar-supervised could not complete training: `{mljar_error}`\n\n"
+                        "Automatically falling back to the built-in scikit-learn AutoML engine."
+                    )
+                    with st.expander("mljar error details (for debugging)", expanded=False):
+                        st.code(mljar_tb)
+
                     try:
-                        import supervised
-                        st.info(f"Current mljar-supervised version: {supervised.__version__}")
-                    except:
-                        st.info("Could not determine mljar-supervised version.")
+                        with st.spinner("Training with scikit-learn AutoML fallback..."):
+                            sklearn_automl = SklearnAutoML(
+                                ml_task=ml_task,
+                                algorithms=selected_algorithms,
+                                total_time_limit=int(time_limit),
+                                random_state=42,
+                            )
+                            sklearn_automl.fit(X, y)
+                            sklearn_automl._results_path = results_path
+
+                        # Store in session state—same key, compatible interface
+                        st.session_state.automl_model = sklearn_automl
+
+                        elapsed_time = time.time() - start_time
+                        st.success(f"Fallback training completed in {elapsed_time:.2f} seconds! "
+                                   f"Best model: **{sklearn_automl._models[0]['name']}** "
+                                   f"(score: {sklearn_automl._models[0]['score']:.4f})")
+
+                        st.write("### AutoML Leaderboard (scikit-learn fallback)")
+                        st.dataframe(sklearn_automl.leaderboard())
+
+                        # Confusion matrix / scatter on training data
+                        try:
+                            predictions = sklearn_automl.predict(X)
+                            if ml_task in ["binary_classification", "multiclass_classification"]:
+                                st.write("### Confusion Matrix (Training Data)")
+                                cm = confusion_matrix(y, predictions)
+                                fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
+                                               labels=dict(x="Predicted", y="Actual"))
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif ml_task == "regression":
+                                st.write("### Predicted vs Actual (Training Data)")
+                                fig = px.scatter(x=y, y=predictions,
+                                                labels={"x": "Actual", "y": "Predicted"})
+                                fig.add_shape(type="line",
+                                             x0=float(min(y)), y0=float(min(y)),
+                                             x1=float(max(y)), y1=float(max(y)),
+                                             line=dict(color="red", dash="dash"))
+                                st.plotly_chart(fig, use_container_width=True)
+                        except Exception:
+                            pass
+
+                    except Exception as fallback_err:
+                        st.error(f"Fallback also failed: {fallback_err}")
+                        st.info("Please check that your dataset has enough rows, "
+                                "no all-NaN columns, and a valid target column.")
         
         # Display any existing results
         if 'automl_model' in st.session_state and st.session_state.automl_model is not None:
